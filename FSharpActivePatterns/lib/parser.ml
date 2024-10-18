@@ -4,6 +4,7 @@
 
 open Angstrom
 open Ast
+open Base
 
 (* TECHNICAL FUNCTIONS *)
 let skip_ws =
@@ -21,34 +22,66 @@ let chainl1 e op =
   e >>= go
 ;;
 
-(* SIMPLE PARSERS *)
-let p_int =
-  take_while1 (function
-    | '0' .. '9' -> true
-    | _ -> false)
-  >>| fun s -> Const (Int_lt (int_of_string s))
+let rec unary_chain op e =
+  op >>= (fun unexpr -> unary_chain op e >>= fun expr -> return (unexpr expr)) <|> e
 ;;
 
-let keywords = [ "if"; "then"; "else"; "let"; "in" ]
+(* SIMPLE PARSERS *)
+let p_int =
+  skip_ws *> take_while1 Char.is_digit >>| fun s -> Const (Int_lt (Int.of_string s))
+;;
+
+let p_bool =
+  skip_ws *> string "true"
+  <|> string "false"
+  >>| fun s -> Const (Bool_lt (Bool.of_string s))
+;;
+
+let is_keyword = function
+  | "if"
+  | "then"
+  | "else"
+  | "let"
+  | "in"
+  | "not"
+  | "true"
+  | "false"
+  | "fun"
+  | "match"
+  | "with" -> true
+  | _ -> false
+;;
 
 let p_ident =
-  take_while1 (function
-    | 'a' .. 'z' | 'A' .. 'Z' | '_' -> true
+  skip_ws
+  *> take_while1 (function
+    | 'a' .. 'z' | 'A' .. 'Z' | '_' | '0' .. '9' -> true
     | _ -> false)
   >>= fun str ->
-  if List.mem str keywords then fail " no keywords pls " else return (Ident str)
+  if is_keyword str
+  then fail "keyword in variable name"
+  else if Char.is_digit (String.get str 0)
+  then fail "variable name cannot start with a digit"
+  else return (Ident str)
 ;;
 
 let p_var = p_ident >>| fun ident -> Variable ident
 
 (* EXPR PARSERS *)
 let p_parens p = skip_ws *> char '(' *> skip_ws *> p <* skip_ws <* char ')' <* skip_ws
-let make_binexpr op expr1 expr2 = Bin_expr (op, expr1, expr2)
+let make_binexpr op expr1 expr2 = Bin_expr (op, expr1, expr2) [@@inline always]
+let make_unexpr op expr = Unary_expr (op, expr) [@@inline always]
 
-let p_binexpr binop constr =
-  skip_ws *> string binop *> skip_ws *> return (make_binexpr constr)
+let p_binexpr binop_str binop =
+  skip_ws *> string binop_str *> skip_ws *> return (make_binexpr binop)
 ;;
 
+let p_unexpr unop_str unop =
+  skip_ws *> string unop_str *> skip_ws *> return (make_unexpr unop)
+;;
+
+let p_not = p_unexpr "not" Unary_not
+let unminus = p_unexpr "-" Unary_minus
 let add = p_binexpr "+" Binary_add
 let sub = p_binexpr "-" Binary_subtract
 let mul = p_binexpr "*" Binary_multiply
@@ -84,10 +117,10 @@ let p_letin p_expr =
          (fun rec_flag name args body in_expr ->
            LetIn (rec_flag, name, args, body, in_expr))
          (string "rec" *> return Rec <|> return Nonrec)
-         (skip_ws *> p_ident >>= fun ident -> return (Some ident) <|> return None)
+         (p_ident >>= fun ident -> return (Some ident) <|> return None)
          (many (skip_ws *> p_var)
           >>= fun args ->
-          if not (List.length args == 0) then return (Some args) else return None)
+          if not (List.length args = 0) then return (Some args) else return None)
          (skip_ws *> string "=" *> skip_ws *> (p_expr <|> p_letin))
     <*> skip_ws *> string "in" *> skip_ws *> (p_expr <|> p_letin))
 ;;
@@ -99,10 +132,10 @@ let p_let p_expr =
   *> lift4
        (fun rec_flag name args body -> Let (rec_flag, name, args, body))
        (string "rec" *> return Rec <|> return Nonrec)
-       (skip_ws *> p_ident)
+       p_ident
        (skip_ws *> many (skip_ws *> p_var)
         >>= fun args ->
-        if not (List.length args == 0) then return (Some args) else return None)
+        if not (List.length args = 0) then return (Some args) else return None)
        (skip_ws *> string "=" *> skip_ws *> p_expr)
 ;;
 
@@ -114,8 +147,11 @@ let p_apply expr =
 let p_expr =
   skip_ws
   *> fix (fun p_expr ->
-    let atom = choice [ p_var; p_int; p_parens p_expr ] in
-    let app = p_apply atom in
+    let atom = choice [ p_var; p_int; p_bool; p_parens p_expr ] in
+    let if_expr = p_if (p_expr <|> atom) <|> atom in
+    let letin_expr = p_letin (p_expr <|> if_expr) <|> if_expr in
+    let unary = choice [ unary_chain p_not letin_expr; unary_chain unminus letin_expr ] in
+    let app = p_apply unary in
     let factor = chainl1 app (mul <|> div) in
     let term = chainl1 factor (add <|> sub) in
     let comp_eq = chainl1 term (equal <|> unequal) in
@@ -123,9 +159,7 @@ let p_expr =
     let comp_gr = chainl1 comp_less (greater_or_equal <|> greater) in
     let comp_and = chainl1 comp_gr log_and in
     let comp_or = chainl1 comp_and log_or in
-    let if_expr = p_if comp_or <|> comp_or in
-    let letin_expr = p_letin if_expr <|> if_expr in
-    letin_expr)
+    comp_or)
 ;;
 
 let p_statement = p_let p_expr
