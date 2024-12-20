@@ -4,6 +4,10 @@
 
 open FSharpActivePatterns.AstPrinter
 open FSharpActivePatterns.Parser
+open FSharpActivePatterns.Inferencer
+open FSharpActivePatterns.TypedTree
+open FSharpActivePatterns.TypesPp
+open FSharpActivePatterns.Ast
 open FSharpActivePatterns.PrettyPrinter
 open Stdlib
 
@@ -11,9 +15,8 @@ type input =
   | Input of string
   | EOF
 
-type 'a run_result =
-  | Result of 'a
-  | Fail
+type run_result =
+  | Result of (construction, string) result
   | Empty
   | End
 
@@ -41,44 +44,93 @@ let input_upto_sep sep ic =
   fill_buffer buffer
 ;;
 
+let input_with_indents ic =
+  let take_line () = In_channel.input_line ic in
+  let rec fill_buffer b =
+    let start_pos = pos_in ic in
+    let line = take_line () in
+    match line with
+    | None -> Input (Buffer.contents b)
+    | Some line ->
+      let is_empty = String.length line = 0 in
+      let is_continue =
+        List.exists (fun pref -> String.starts_with ~prefix:pref line) [ " "; "\t"; "\n" ]
+        || is_empty
+        || String.starts_with ~prefix:"and" (String.trim line)
+      in
+      (match is_continue with
+       | true ->
+        let newline = " " ^ line in
+         Buffer.add_string b newline;
+         Buffer.add_string b "\n";
+         fill_buffer b
+       | false ->
+         seek_in ic start_pos;
+         Buffer.add_string b "\n";
+         Input (Buffer.contents b))
+  in
+  let buffer = Buffer.create 1024 in
+  let first_line = take_line () in
+  match first_line with
+  | None ->
+    EOF
+  | Some first_line ->
+    Buffer.add_string buffer first_line;
+    fill_buffer buffer
+;;
+
 let run_single ic =
-  match input_upto_sep ";;" ic with
+  let input =
+    match ic with
+    | None -> input_upto_sep ";;" stdin
+    | Some ic -> input_with_indents ic
+  in
+  match input with
   | EOF -> End
   | Input input ->
     let trimmed_input = String.trim input in
-    if trimmed_input = ""
-    then Empty
-    else (
-      match parse trimmed_input with
-      | Some ast -> Result ast
-      | None -> Fail)
+    if trimmed_input = "" then Empty else Result (parse trimmed_input)
 ;;
 
 let run_repl dump_parsetree input_file =
   let ic =
     match input_file with
-    | None -> stdin
-    | Some n -> open_in n
+    | None -> None
+    | Some n -> Some (open_in n)
   in
-  let rec run_repl_helper run =
+  let rec run_repl_helper run env state =
     let open Format in
     match run ic with
-    | Fail -> fprintf err_formatter "Error occured\n"
+    | Result (Error e) -> fprintf err_formatter "%s\n" e
     | Empty ->
       fprintf std_formatter "\n";
       print_flush ();
-      run_repl_helper run
+      run_repl_helper run env state
     | End -> ()
-    | Result ast ->
+    | Result (Ok ast) ->
       (match dump_parsetree with
        | true -> print_construction std_formatter ast
        | false ->
-         fprintf std_formatter "- : ";
-         pp_construction std_formatter ast);
-      print_flush ();
-      run_repl_helper run
+         let result = infer ast env state in
+         (match result with
+          | new_state, Error err ->
+            fprintf err_formatter "Type checking failed: %a\n" pp_error err;
+            print_flush ();
+            run_repl_helper run env new_state
+          | new_state, Ok (env, names_and_types) ->
+            List.iter
+              (fun (n, t) -> fprintf std_formatter "%s : %a" n pp_typ t)
+              names_and_types;
+            print_flush ();
+            run_repl_helper run env new_state))
   in
-  run_repl_helper run_single
+  let env =
+    TypeEnvironment.extend
+      TypeEnvironment.empty
+      "print_int"
+      (Scheme (VarSet.empty, Arrow (int_typ, unit_typ)))
+  in
+  run_repl_helper run_single env 0
 ;;
 
 type opts =
